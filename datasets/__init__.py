@@ -6,7 +6,7 @@ def fetch(url: str) -> bytes:
         with open(fp, "rb") as f:
             dat = f.read()
     else:
-        print("fetching %s" % url)
+        print(f"Fetching {url}")
         r = requests.get(url)
         assert r.status_code == 200
         dat = r.content

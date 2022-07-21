@@ -1,8 +1,8 @@
+#!/usr/bin/env python3
 import io
 import os
 import sys
 import torch
-from matplotlib import pyplot as plt
 from PIL import Image
 
 from models.resnet import ResNet
@@ -40,6 +40,7 @@ if __name__ == "__main__":
     batch = preprocess(img).unsqueeze(0)
 
     # If you want to see the preprocessed image
+    # from matplotlib import pyplot as plt
     # plt.imshow(batch[0].permute((1, 2, 0)))
 
     prediction = model(batch).squeeze(0).softmax(0)
