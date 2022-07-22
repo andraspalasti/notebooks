@@ -42,6 +42,7 @@ if __name__ == "__main__":
     # If you want to see the preprocessed image
     # from matplotlib import pyplot as plt
     # plt.imshow(batch[0].permute((1, 2, 0)))
+    # plt.show()
 
     prediction = model(batch).squeeze(0).softmax(0)
     class_id = prediction.argmax().item()
