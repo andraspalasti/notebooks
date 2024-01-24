@@ -27,12 +27,15 @@ class DRAW(nn.Module):
         self.read_size = read_size
         self.write_size = write_size
 
-        # self.init_c = torch.zeros((self.in_channels, *img_size), dtype=torch.float32)
-        # self.init_h_enc = torch.zeros(2*self.hidden_size, dtype=torch.float32)
-        # self.init_h_dec = torch.zeros(2*self.hidden_size, dtype=torch.float32)
+        self.init_canvas = nn.Parameter(
+            torch.zeros((1, self.in_channels, self.img_h, self.img_w)))
+        self.init_h_enc = nn.Parameter(
+            torch.zeros((1, self.hidden_size)))
+        self.init_h_dec = nn.Parameter(
+            torch.zeros((1, self.hidden_size)))
 
         self.encoder = nn.LSTMCell(
-            input_size=2*self.read_size**2 + 2*self.hidden_size,
+            input_size=2*self.read_size**2 + 1*self.hidden_size,
             hidden_size=self.hidden_size,
         )
         self.decoder = nn.LSTMCell(
@@ -40,59 +43,40 @@ class DRAW(nn.Module):
             hidden_size=self.hidden_size,
         )
 
-        self.Qsampler = nn.Linear(2*self.hidden_size, 2*self.latent_dims)
+        self.sampler = nn.Linear(1*self.hidden_size, 2*self.latent_dims)
 
-        self.reader_attn = nn.Linear(2*self.hidden_size, out_features=5)
-        self.writer_attn = nn.Linear(2*self.hidden_size, out_features=5)
+        self.reader_attn = nn.Linear(1*self.hidden_size, out_features=5)
+        self.writer_attn = nn.Linear(1*self.hidden_size, out_features=5)
 
-        self.writer = nn.Linear(2*self.hidden_size, self.write_size**2)
-
-    def sample_img(self, glimpses: int):
-        canvas = self.init_c.unsqueeze(dim=0)
-        prev_h_dec = self.init_h_dec.unsqueeze(dim=0)
-        for _ in range(glimpses):
-            z = torch.randn((1, self.latent_dims))
-            h_dec = torch.cat(self.decoder(
-                input=z, hx=(prev_h_dec[:, :self.hidden_size],
-                             prev_h_dec[:, self.hidden_size:])
-            ), dim=1)
-            canvas = canvas + self.write(h_dec)
-            prev_h_dec = F.tanh(h_dec)
-        return F.sigmoid(canvas)
+        self.writer = nn.Linear(1*self.hidden_size, self.write_size**2)
 
     def forward(self, x: Tensor, glimpses: int):
-        #  [B x C x H x W]
         batch_size = x.size(0)
 
-        # canvas = torch.stack([self.init_c] * batch_size).to(x.device)
-        # prev_h_dec = torch.stack([self.init_h_dec] * batch_size).to(x.device)
-        # prev_h_enc = torch.stack([self.init_h_enc] * batch_size).to(x.device)
-
-        canvas = torch.zeros((batch_size, self.in_channels, self.img_h, self.img_w)).to(x.device)
-        prev_h_dec = torch.zeros((batch_size, 2*self.hidden_size)).to(x.device)
-        prev_h_enc = torch.zeros((batch_size, 2*self.hidden_size)).to(x.device)
+        canvas = torch.cat([self.init_canvas] * batch_size).to(x.device)
+        h_dec, c_dec = torch.cat([self.init_h_dec] * batch_size).to(x.device), \
+            torch.zeros((batch_size, self.hidden_size), device=x.device)
+        h_enc, c_enc = torch.cat([self.init_h_enc] * batch_size).to(x.device), \
+            torch.zeros((batch_size, self.hidden_size), device=x.device)
 
         mu, log_var = [0] * glimpses, [0] * glimpses
         for t in range(glimpses):
             x_error = x - F.sigmoid(canvas)
-            r = self.read(x, x_error, prev_h_dec)
-            h_enc = torch.cat(self.encoder(
-                input=torch.cat((r, prev_h_dec), dim=1),
-                hx=(prev_h_enc[:, :self.hidden_size],
-                    prev_h_enc[:, self.hidden_size:])
-            ), dim=1)
+            r = self.read(x, x_error, h_dec)
+            h_enc, c_enc = self.encoder(
+                input=torch.cat((r, h_dec), dim=1),
+                hx=(h_enc, c_enc)
+            )
             z, mu[t], log_var[t] = self.sample_from_Q(h_enc)
-            h_dec = torch.cat(self.decoder(
-                input=z, hx=(prev_h_dec[:, :self.hidden_size],
-                             prev_h_dec[:, self.hidden_size:])
-            ), dim=1)
+            h_dec, c_dec = self.decoder(
+                input=z, hx=(h_dec, c_dec)
+            )
             canvas = canvas + self.write(h_dec)
-            prev_h_dec, prev_h_enc = h_dec, h_enc
 
         return F.sigmoid(canvas), torch.stack(mu, dim=1), torch.stack(log_var, dim=1)
 
     def sample_from_Q(self, h_enc: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
-        s = self.Qsampler(h_enc)
+        s = self.sampler(h_enc)
         mu, log_var = s[:, :self.latent_dims], s[:, self.latent_dims:]
         eps = torch.randn_like(log_var)
         return mu + torch.exp(log_var*0.5) * eps, mu, log_var
@@ -177,6 +161,10 @@ class DRAWExperiment(L.LightningModule):
 
         return loss
 
+    def on_validation_epoch_start(self):
+        self.batches = []
+        self.log
+
     def configure_optimizers(self):
         optimizer = optim.Adam(self.model.parameters(), lr=0.0003)
         return optimizer
@@ -189,7 +177,7 @@ def binarized(img):
 
 def main():
     cpu_count = os.cpu_count()
-    if cpu_count is None: cpu_count = 4
+    if cpu_count is None: cpu_count = 2
 
     torch.manual_seed(1265)
 
@@ -199,16 +187,15 @@ def main():
                            download=True, transform=binarized)
 
     # TODO: Change num_workers
-    loader_args = dict(batch_size=100, pin_memory=True,
-                       num_workers=1, persistent_workers=True)
+    loader_args = dict(batch_size=100, pin_memory=True,)
     train_loader = DataLoader(train_set, **loader_args)
-    val_loader = DataLoader(validation_set, **loader_args, shuffle=False)
+    val_loader = DataLoader(validation_set, **loader_args, shuffle=False, drop_last=True)
 
     model = DRAWExperiment(glimpses=64, read_size=2, write_size=5)
 
     print(f'Training images: {len(train_set)}')
     print(f'Validation images: {len(validation_set)}')
-    print(f"Batch size: {loader_args['batch_size']} Num workers: {loader_args['num_workers']}")
+    # print(f"Batch size: {loader_args['batch_size']} Num workers: {loader_args['num_workers']}")
 
     # TODO: change overfit and max_epochs, log_every_n_step
     trainer = L.Trainer(
@@ -216,7 +203,7 @@ def main():
         overfit_batches=1,
         log_every_n_steps=1,
         gradient_clip_val=10.0,
-        max_epochs=500,
+        # max_epochs=500,
         accelerator='cpu',
     )
     trainer.fit(model, train_dataloaders=train_loader,
