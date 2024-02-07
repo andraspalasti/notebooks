@@ -40,12 +40,13 @@ class DRAW(nn.Module):
         self.read_size = read_size
         self.write_size = write_size
 
-        self.canvas_init = nn.Parameter(torch.zeros((self.in_channels, self.img_h, self.img_w)))
+        self.canvas_init = nn.Parameter(
+            torch.zeros((self.in_channels, self.img_h, self.img_w)))
         self.h_dec_init = nn.Parameter(torch.zeros((self.hidden_size)))
         self.h_enc_init = nn.Parameter(torch.zeros((self.hidden_size)))
 
         self.encoder = nn.LSTMCell(
-            # input_size=2*self.in_channels*self.img_h*self.img_w + self.hidden_size, # no attention
+            # input_size=2*self.in_channels*self.img_h*self.img_w + self.hidden_size, # no attention
             input_size=2*self.read_size**2 + self.hidden_size,
             hidden_size=self.hidden_size,
         )
@@ -62,17 +63,8 @@ class DRAW(nn.Module):
         self.writer = nn.Linear(
             in_features=self.hidden_size,
             out_features=self.write_size**2,
-            # out_features=self.in_channels*self.img_h*self.img_w, # no attention
+            # out_features=self.in_channels*self.img_h*self.img_w, # no attention
         )
-
-    def sample(self, z: Tensor):
-        glimpses = z.size(0)
-        canvas = [self.canvas_init] * (glimpses+1)
-        h_dec, c_dec = self.h_dec_init, torch.zeros((self.hidden_size,))
-        for t in range(glimpses):
-            h_dec, c_dec = self.decoder(z[t], (h_dec, c_dec))
-            canvas[t+1] = canvas[t] + self.write(torch.unsqueeze(h_dec, dim=0)).squeeze(dim=0)
-        return canvas
 
     def forward(self, x: Tensor, glimpses: int):
         """Performs a forward operation on a batch of inputs.
@@ -91,6 +83,7 @@ class DRAW(nn.Module):
             torch.zeros((batch_size, self.hidden_size), device=x.device)
 
         mu, log_var = [0] * glimpses, [0] * glimpses
+        eps = torch.randn((batch_size, self.latent_dims), device=x.device)
         for t in range(glimpses):
             x_error = x - F.sigmoid(canvas)
 
@@ -98,26 +91,14 @@ class DRAW(nn.Module):
             enc_input = torch.cat((r, h_dec), dim=1)
             h_enc, c_enc = self.encoder(enc_input, (h_enc, c_enc))
 
-            z, mu[t], log_var[t] = self.sample_from_Q(h_enc)
+            s = self.sampler(h_enc)
+            mu[t], log_var[t] = s[:, :self.latent_dims], s[:, self.latent_dims:]
+            z = mu[t] + torch.exp(log_var[t]*0.5) * eps
 
             h_dec, c_dec = self.decoder(z, (h_dec, c_dec))
             canvas = canvas + self.write(h_dec)
 
         return F.sigmoid(canvas), torch.stack(mu, dim=1), torch.stack(log_var, dim=1)
-
-    def sample_from_Q(self, h_enc: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
-        """Samples Zt ~ Q(h_enc) via reparameterization trick from normal distribution.
-
-        Args:
-            h_enc: The hidden state of the encoder.
-
-        Returns:
-            A tuple of tensors (z, mu, log_var).
-        """
-        s = self.sampler(h_enc)
-        mu, log_var = s[:, :self.latent_dims], s[:, self.latent_dims:]
-        eps = torch.randn_like(log_var)
-        return mu + torch.exp(log_var*0.5) * eps, mu, log_var
 
     def write_no_attn(self, h_dec: Tensor):
         w = self.writer(h_dec)
@@ -222,10 +203,11 @@ class DRAWExperiment(L.LightningModule):
 
     def on_validation_start(self):
         self.generated_images = []
-        self.val_start_step = self.global_step
+        self.num_batches = 0
         self.recon_loss, self.latent_loss = 0, 0
 
     def validation_step(self, batch):
+        self.num_batches += 1
         with torch.no_grad():
             x, _ = batch
             canvas, mu, log_var = self.model(x, self.glimpses)
@@ -236,7 +218,6 @@ class DRAWExperiment(L.LightningModule):
             self.generated_images.append((x[0], canvas[0]))
 
     def on_validation_end(self):
-        num_batches = self.global_step - self.val_start_step
         if isinstance(self.logger, WandbLogger):
             self.logger.log_image(
                 key='expected',
@@ -247,13 +228,14 @@ class DRAWExperiment(L.LightningModule):
                 images=[generated for _, generated in self.generated_images]
             )
             self.logger.log_metrics({
-                'val/loss': (self.recon_loss + self.latent_loss) / num_batches,
-                'val/recon_loss': self.recon_loss / num_batches,
-                'val/latent_loss': self.latent_loss / num_batches,
+                'val/loss': (self.recon_loss + self.latent_loss) / self.num_batches,
+                'val/recon_loss': self.recon_loss / self.num_batches,
+                'val/latent_loss': self.latent_loss / self.num_batches,
             })
 
     def configure_optimizers(self):
-        optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        # TODO: I don't know how does the change in betas effect the training.
+        optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate, betas=(0.5, 0.999))
         return optimizer
 
 
@@ -272,14 +254,14 @@ def parse_args():
                 default=None, help="The weights to load")
     parser.add_argument("--sample", dest="sample", action='store_true',
                 default=False, help="Sample image from model (use with load)")
-    parser.add_argument("--attention", "-a", type=str, default="2,5",
+    parser.add_argument("--attention", "-a", type=str, default="5,5",
                 help="Use attention mechanism (read_window,write_window)")
     parser.add_argument("--glimpses", type=int, dest="glimpses",
-                default=20, help="No. of iterations")
+                default=10, help="No. of iterations")
     parser.add_argument("--hidden-size", type=int, dest="hidden_size",
                 default=256, help="RNN state dimension")
     parser.add_argument("--z-dim", type=int, dest="z_dim",
-                default=100, help="Z-vector dimension")
+                default=10, help="Z-vector dimension")
     return parser.parse_args()
 
 
@@ -291,27 +273,36 @@ def main():
         experiment = DRAWExperiment.load_from_checkpoint(args.load)
         print(f'Checkpoint succesfully loaded from: {args.load}!')
     else:
+        torch.manual_seed(1265)
         experiment = DRAWExperiment(
             glimpses=args.glimpses, read_size=read_size,
             hidden_size=args.hidden_size, learning_rate=args.learning_rate,
             write_size=write_size, latent_dims=args.z_dim)
 
+    train_set = MNIST('datasets', train=True,
+                      download=True, transform=binarized)
+    validation_set = MNIST('datasets', train=False,
+                           download=True, transform=binarized)
+
+    # NOTE: This is not truly sampling
     if args.sample:
         save_path = Path('sample.png')
-        z = torch.randn((experiment.glimpses, experiment.model.latent_dims))
-        canvases = experiment.model.sample(z)
-        save_image(canvases, save_path)
+        imgs = torch.stack([validation_set[i][0] for i in range(10, 15)])
+
+        model = experiment.model.to('cpu')
+        canvases = [0] * experiment.glimpses 
+        for i in range(experiment.glimpses):
+            torch.manual_seed(1265)
+            canvases[i], _, _ = model.forward(imgs, glimpses=i+1)
+        canvases = torch.stack(canvases, dim=1).reshape((-1, 1, 28, 28))
+
+        save_image(canvases, save_path, nrow=experiment.glimpses)
         print(f'Successfully saved image to: {save_path}!')
         return
 
     cpu_count = os.cpu_count()
     if cpu_count is None:
-        cpu_count = 2
-
-    train_set = MNIST('datasets', train=True,
-                      download=True, transform=binarized)
-    validation_set = MNIST('datasets', train=False,
-                           download=True, transform=binarized)
+        cpu_count = 4
 
     loader_args = dict(batch_size=args.batch_size, pin_memory=True, num_workers=cpu_count)
     train_loader = DataLoader(train_set, **loader_args)
@@ -326,8 +317,9 @@ def main():
 
     trainer = L.Trainer(
         deterministic=True,
-        max_epochs=10,
+        max_steps=10000,
         log_every_n_steps=10,
+        # accelerator='cpu',
         gradient_clip_algorithm='norm',
         gradient_clip_val=5.0,
         logger=wandb_logger,
@@ -337,5 +329,4 @@ def main():
 
 
 if __name__ == '__main__':
-    torch.manual_seed(1265)
     main()
